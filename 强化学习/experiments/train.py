@@ -20,8 +20,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from experiments.envs import SequentialKeyLockEnv, CooperativeTransportEnv
-from experiments.algorithms import CMAPG, MAPPO, QMIX
+from experiments.envs import SequentialKeyLockEnv, CooperativeTransportEnv, MPEEnvWrapper
+from experiments.algorithms import CMAPG, COMA, MAPPO, QMIX
 from experiments.utils import Logger, evaluate, compute_credit_assignment_accuracy
 
 
@@ -30,9 +30,9 @@ def parse_args():
 
     # Experiment
     parser.add_argument("--algo", type=str, default="cmapg",
-                        choices=["cmapg", "mappo", "qmix"])
+                        choices=["cmapg", "coma", "mappo", "qmix"])
     parser.add_argument("--env", type=str, default="key_lock",
-                        choices=["key_lock", "transport"])
+                        choices=["key_lock", "transport", "mpe"])
     parser.add_argument("--n_agents", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--exp_name", type=str, default="", help="Experiment name suffix")
@@ -58,6 +58,9 @@ def parse_args():
     parser.add_argument("--lambda_psi", type=float, default=0.5)
     parser.add_argument("--lambda_mi", type=float, default=0.1)
     parser.add_argument("--alpha_default", type=float, default=0.5)
+    parser.add_argument("--adv_mode", type=str, default="softmax_gae",
+                        choices=["softmax_gae", "direct_cf", "normalized_cf"],
+                        help="Advantage computation mode for CMAPG")
 
     # QMIX-specific
     parser.add_argument("--epsilon_start", type=float, default=1.0)
@@ -68,17 +71,25 @@ def parse_args():
     # Misc
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--log_dir", type=str, default="./logs")
+    parser.add_argument("--scenario", type=str, default="simple_spread_v3",
+                        help="MPE scenario name (simple_spread_v3, simple_push_v3)")
+    parser.add_argument("--max_cycles", type=int, default=100,
+                        help="Max cycles per episode for MPE environments")
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--resume", type=str, default="", help="Resume from checkpoint path")
 
     return parser.parse_args()
 
 
-def make_env(env_name: str, n_agents: int, seed: int):
+def make_env(env_name: str, n_agents: int, seed: int, **kwargs):
     if env_name == "key_lock":
         return SequentialKeyLockEnv(n_agents=n_agents, max_steps=200, seed=seed, press_radius=1.5)
     elif env_name == "transport":
         return CooperativeTransportEnv(n_agents=n_agents, max_steps=200, seed=seed)
+    elif env_name == "mpe":
+        scenario = kwargs.get("scenario", "simple_spread_v3")
+        max_cycles = kwargs.get("max_cycles", 100)
+        return MPEEnvWrapper(scenario=scenario, n_agents=n_agents, max_cycles=max_cycles, seed=seed)
     else:
         raise ValueError(f"Unknown environment: {env_name}")
 
@@ -93,7 +104,10 @@ def create_algorithm(algo_name: str, env, args):
         obs_dim = sample_obs.n
 
     obs_dims = [obs_dim] * args.n_agents
-    state_dim = obs_dim * args.n_agents  # Global state = concatenated observations
+    if hasattr(env, "get_state"):
+        state_dim = int(env.get_state().shape[0])
+    else:
+        state_dim = obs_dim * args.n_agents  # Global state = concatenated observations
 
     if isinstance(env.action_space[f"agent_0"], type(env.action_space[f"agent_0"])):
         if hasattr(env.action_space[f"agent_0"], "n"):
@@ -128,8 +142,17 @@ def create_algorithm(algo_name: str, env, args):
             lambda_psi=args.lambda_psi,
             lambda_mi=args.lambda_mi,
             alpha_default=args.alpha_default,
+            adv_mode=args.adv_mode,
         )
         algo = CMAPG(**kwargs)
+    elif algo_name == "coma":
+        kwargs.update(
+            discrete_actions=discrete,
+            gae_lambda=args.gae_lambda,
+            clip_epsilon=args.clip_epsilon,
+            entropy_coef=args.entropy_coef,
+        )
+        algo = COMA(**kwargs)
     elif algo_name == "mappo":
         kwargs.update(
             discrete_actions=discrete,
@@ -228,14 +251,14 @@ def train_policy_gradient(algo, env_ctor, args, logger: Logger):
         # Evaluation
         if total_steps % args.eval_freq == 0:
             eval_results = evaluate(algo, env_ctor, args.n_agents, n_episodes=10)
-            logger.log_eval(total_steps, eval_results["mean_return"], eval_results["std_return"])
 
             # Credit assignment accuracy
             ca_env = env_ctor()
             ca_acc = compute_credit_assignment_accuracy(algo, ca_env, args.n_agents)
+            ca_env.close()
+
             logger.log_eval(total_steps, eval_results["mean_return"], eval_results["std_return"],
                            {"ca_accuracy": ca_acc})
-            ca_env.close()
             print(f"Step {total_steps:7d} | Return: {eval_results['mean_return']:8.3f} ± {eval_results['std_return']:6.3f}")
 
         # Save
@@ -382,9 +405,16 @@ def main():
 
     # Create environment factory
     def env_ctor():
-        return make_env(args.env, args.n_agents, args.seed)
+        return make_env(args.env, args.n_agents, args.seed,
+                        scenario=args.scenario, max_cycles=args.max_cycles)
 
     env = env_ctor()
+
+    # MPE env determines n_agents from scenario
+    if args.env == "mpe":
+        args.n_agents = env.n_agents
+        print(f"MPE scenario '{args.scenario}': {args.n_agents} agents, "
+              f"obs_dim={env.observation_space[env._agent_ids[0]].shape[0]}")
 
     # Create algorithm
     algo = create_algorithm(args.algo, env, args)
@@ -420,7 +450,7 @@ def main():
 
     # Train
     try:
-        if args.algo in ["cmapg", "mappo"]:
+        if args.algo in ["cmapg", "coma", "mappo"]:
             train_policy_gradient(algo, env_ctor, args, logger)
         else:
             train_qmix(algo, env_ctor, args, logger)

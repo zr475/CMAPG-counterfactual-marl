@@ -99,8 +99,9 @@ def compute_credit_assignment_accuracy(
 ) -> float:
     """Evaluate credit assignment accuracy.
 
-    Computes Pearson correlation between algorithm's advantage estimates
-    and environment's ground-truth individual contributions.
+    Computes Pearson correlation between algorithm's per-agent advantage estimates
+    (A_i^{cf} = Q - Ψ for CMAPG, uniform Q/n for MAPPO) and the environment's
+    per-step ground-truth individual contributions.
     """
     obs, _ = env.reset()
     obs_list = [obs[f"agent_{i}"] for i in range(n_agents)]
@@ -108,26 +109,38 @@ def compute_credit_assignment_accuracy(
     all_estimated = []
     all_ground_truth = []
 
+    success_steps = 0
+
     for _ in range(n_steps):
-        # Get actions and log probs
         if hasattr(algorithm, "get_actions"):
             actions, log_probs = algorithm.get_actions(obs_list, deterministic=False)
         else:
             actions = algorithm.select_actions(obs_list, explore=False).tolist()
-            log_probs = [0.0 for _ in range(n_agents)]
 
         action_dict = {f"agent_{i}": actions[i] for i in range(n_agents)}
         next_obs, reward, terminated, truncated, info = env.step(action_dict)
 
-        # Get ground-truth credit from env
-        if hasattr(env, "get_ground_truth_credit"):
+        # Get per-step ground-truth contribution
+        if hasattr(env, "get_step_credit"):
+            gt_credit = env.get_step_credit()
+        elif hasattr(env, "get_ground_truth_credit"):
             gt_credit = env.get_ground_truth_credit()
-            all_ground_truth.append(gt_credit)
+        else:
+            gt_credit = np.zeros(n_agents)
 
-        # Use log probs as a proxy for advantage estimates
-        # (actual advantages would come from the algorithm's internal computation)
-        est = np.array([lp.item() if hasattr(lp, 'item') else float(lp) for lp in log_probs])
-        all_estimated.append(est)
+        # Compute real advantage estimates from the algorithm
+        state = np.concatenate([obs_list[i] for i in range(n_agents)])
+        actions_arr = np.array(actions)
+        if hasattr(algorithm, "evaluate_advantages"):
+            adv = algorithm.evaluate_advantages(obs_list, state, actions_arr)
+        else:
+            adv = np.zeros(n_agents)
+
+        all_estimated.append(adv)
+        all_ground_truth.append(gt_credit)
+
+        if np.any(gt_credit > 0):
+            success_steps += 1
 
         obs_list = [next_obs[f"agent_{i}"] for i in range(n_agents)]
 
@@ -138,7 +151,6 @@ def compute_credit_assignment_accuracy(
     if len(all_ground_truth) == 0:
         return 0.0
 
-    # Compute Pearson correlation
     est_arr = np.array(all_estimated)
     gt_arr = np.array(all_ground_truth)
 
@@ -152,4 +164,5 @@ def compute_credit_assignment_accuracy(
                 if not np.isnan(corr):
                     correlations.append(corr)
 
-    return float(np.mean(correlations)) if correlations else 0.0
+    mean_corr = float(np.mean(correlations)) if correlations else 0.0
+    return mean_corr

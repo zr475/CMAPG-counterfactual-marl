@@ -20,7 +20,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.ticker import MaxNLocator
-import seaborn as sns
 
 # Set publication-quality style
 plt.rcParams.update({
@@ -177,50 +176,142 @@ def _smooth(y, window=5):
     return np.convolve(y, kernel, mode="same")
 
 
+def _dedup_metrics(metrics: Dict) -> Dict:
+    """Remove duplicate entries caused by double log_eval calls in older training runs.
+
+    Consecutive identical eval_return_mean values (within 1e-6) are collapsed
+    to single entries, keeping only the first occurrence (which may have ca_accuracy).
+    """
+    returns = np.array(metrics.get("eval_return_mean", []))
+    if len(returns) <= 1:
+        return metrics
+    # Find indices where consecutive values differ
+    keep = [0]
+    for i in range(1, len(returns)):
+        if abs(returns[i] - returns[i - 1]) > 1e-6:
+            keep.append(i)
+    # Also keep the last entry with ca_accuracy if present
+    result = {}
+    for key, vals in metrics.items():
+        if not isinstance(vals, list):
+            result[key] = vals
+            continue
+        arr = np.array(vals)
+        if len(arr) == len(returns):
+            result[key] = arr[keep].tolist()
+        else:
+            result[key] = vals
+    return result
+
+
+def _load_multi_seed_metrics(method: str, seeds: List[int], log_dir: str) -> List[Dict]:
+    """Load metrics.json from multiple seeds, return list of deduplicated metric dicts."""
+    results = []
+    for seed in seeds:
+        path = os.path.join(log_dir, f"{method}_key_lock_n5_s{seed}", "metrics.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                results.append(_dedup_metrics(json.load(f)))
+    return results
+
+
+def _align_multi_seed_curves(metrics_list: List[Dict], key: str = "eval_return_mean",
+                              steps_key: str = "eval_step") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Align curves from multiple seeds: compute mean and std across seeds at common steps."""
+    if not metrics_list:
+        return np.array([]), np.array([]), np.array([])
+    # Find common steps (all seeds use same eval_freq, so steps should be identical)
+    common_steps = np.array(metrics_list[0].get(steps_key, []))
+    all_curves = []
+    for m in metrics_list:
+        steps = np.array(m.get(steps_key, []))
+        vals = np.array(m.get(key, []))
+        if len(steps) != len(common_steps):
+            continue
+        all_curves.append(vals)
+    if not all_curves:
+        return np.array([]), np.array([]), np.array([])
+    stacked = np.array(all_curves)  # (n_seeds, n_evals)
+    mean = np.mean(stacked, axis=0)
+    std = np.std(stacked, axis=0)
+    return common_steps, mean, std
+
+
 def plot_credit_assignment():
-    """Plot credit assignment accuracy comparison using real data."""
+    """Plot multi-seed training curves and stability analysis."""
     from matplotlib.ticker import MaxNLocator
 
     log_dir = os.path.join(SYS_PATH, "logs")
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.0, 3.0))
-
+    seeds = [42, 123, 456, 789]
     methods = ["cmapg", "mappo"]
-    all_data = {}
-    for method in methods:
-        for p in [os.path.join(log_dir, f"{method}_train.log"),
-                  os.path.join(SYS_PATH, "logs_v3", f"{method}_train.log")]:
-            p = os.path.normpath(p)
-            if os.path.exists(p):
-                all_data[method] = _parse_log(p)
-                break
 
-    window = 5
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.5, 3.0))
+
+    # Left: Multi-seed learning curves with std bands
+    window = 8
     for method in methods:
-        if method not in all_data:
+        metrics_list = _load_multi_seed_metrics(method, seeds, log_dir)
+        if not metrics_list:
             continue
-        d = all_data[method]
-        # Smooth returns
-        ret_smooth = _smooth(d["returns"], window)
-        ax1.plot(d["steps_ret"] / 1000, ret_smooth,
-                color=COLORS[method], label=METHOD_NAMES[method], lw=1.5)
-        # CA accuracy
-        if len(d["ca_acc"]) > 0:
-            ca_smooth = _smooth(d["ca_acc"], window * 5)
-            ax2.plot(d["steps_ca"] / 1000, ca_smooth,
-                    color=COLORS[method], label=METHOD_NAMES[method], lw=1.5)
+        steps, mean, std = _align_multi_seed_curves(metrics_list)
+        if len(steps) == 0:
+            continue
+        steps_k = steps / 1000
+        mean_smooth = _smooth(mean, window)
+        std_smooth = _smooth(std, window)
+        ax1.plot(steps_k, mean_smooth, color=COLORS[method],
+                label=f"{METHOD_NAMES[method]} ({len(metrics_list)} seeds)", lw=1.5)
+        ax1.fill_between(steps_k, mean_smooth - std_smooth, mean_smooth + std_smooth,
+                        color=COLORS[method], alpha=0.15)
 
+    ax1.axhline(y=3.4, color="gray", linestyle="--", alpha=0.5, lw=0.8, label="Optimal (~3.4)")
     ax1.set_xlabel("Environment Steps (K)")
     ax1.set_ylabel("Episode Return")
-    ax1.set_title("Learning Curves on Key-Lock", fontweight="bold")
-    ax1.legend()
-    ax1.axhline(y=3.4, color="gray", linestyle="--", alpha=0.5, label="Optimal (~3.4)")
+    ax1.set_title("Learning Curves on Key-Lock (N=5, 4 seeds)", fontweight="bold")
+    ax1.legend(fontsize=7)
     ax1.yaxis.set_major_locator(MaxNLocator(6))
+    ax1.grid(True, alpha=0.2)
 
-    ax2.set_xlabel("Environment Steps (K)")
-    ax2.set_ylabel("Pearson Correlation")
-    ax2.set_title("Credit Assignment Accuracy", fontweight="bold")
-    ax2.legend()
-    ax2.yaxis.set_major_locator(MaxNLocator(6))
+    # Right: Multi-seed Peak vs Final with error bars
+    stability_data = {}
+    for method in methods:
+        metrics_list = _load_multi_seed_metrics(method, seeds, log_dir)
+        if not metrics_list:
+            continue
+        peaks = []
+        finals = []
+        for m in metrics_list:
+            returns = np.array(m.get("eval_return_mean", []))
+            if len(returns) == 0:
+                continue
+            peaks.append(float(np.max(returns)))
+            final_window = returns[-min(5, len(returns)):]
+            finals.append(float(np.mean(final_window)))
+        if peaks:
+            stability_data[method] = {
+                "peak_mean": np.mean(peaks), "peak_std": np.std(peaks),
+                "final_mean": np.mean(finals), "final_std": np.std(finals),
+            }
+
+    if stability_data:
+        x = np.arange(len(stability_data))
+        width = 0.3
+        for i, (method, sd) in enumerate(stability_data.items()):
+            color = COLORS[method]
+            label = METHOD_NAMES[method]
+            ax2.bar(x[i] - width/2, sd["peak_mean"], width, color=color, alpha=0.85,
+                  edgecolor="black", lw=0.5, yerr=sd["peak_std"], capsize=3,
+                  label="Peak" if i == 0 else "")
+            ax2.bar(x[i] + width/2, sd["final_mean"], width, color=color, alpha=0.4,
+                  edgecolor="black", lw=0.5, yerr=sd["final_std"], capsize=3,
+                  label="Final" if i == 0 else "")
+        ax2.set_xticks(x)
+        ax2.set_xticklabels([METHOD_NAMES[m] for m in stability_data.keys()])
+        ax2.set_ylabel("Episode Return")
+        ax2.set_title("Peak vs Final (4 seeds, mean ± std)", fontweight="bold")
+        ax2.legend(fontsize=7)
+        ax2.axhline(y=3.4, color="gray", linestyle="--", alpha=0.4, lw=0.8)
+        ax2.grid(True, alpha=0.15, axis="y")
 
     fig.tight_layout()
     fig.savefig(os.path.join(FIG_DIR, "credit_assignment.pdf"))
@@ -259,7 +350,7 @@ def _extract_scalability_metrics(log_path: str) -> Dict:
 
 
 def plot_scalability():
-    """Plot performance vs. number of agents using real experimental data."""
+    """Plot performance vs. number of agents using real experimental data (multi-seed for N=5)."""
     from matplotlib.ticker import MaxNLocator
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.5, 3.2))
@@ -268,54 +359,74 @@ def plot_scalability():
     n_agents_list = [3, 5, 7, 10]
     scalability_dir = os.path.join(SYS_PATH, "logs", "scalability")
     main_log_dir = os.path.join(SYS_PATH, "logs")
+    seeds = [42, 123, 456, 789]
 
-    # Collect real data
     peak_data = {m: [] for m in methods}
+    peak_err = {m: [] for m in methods}
     final_data = {m: [] for m in methods}
-    std_data = {m: [] for m in methods}
+    final_err = {m: [] for m in methods}
     valid_n = []
 
     for n in n_agents_list:
         all_valid = True
         for method in methods:
             if n == 5:
-                log_path = os.path.join(main_log_dir, f"{method}_train.log")
+                # Multi-seed for N=5
+                metrics_list = _load_multi_seed_metrics(method, seeds, main_log_dir)
+                if metrics_list:
+                    peaks = []
+                    finals = []
+                    for m in metrics_list:
+                        returns = np.array(m.get("eval_return_mean", []))
+                        if len(returns) == 0:
+                            continue
+                        peaks.append(float(np.max(returns)))
+                        finals.append(float(np.mean(returns[-5:])))
+                    if peaks:
+                        peak_data[method].append(np.mean(peaks))
+                        peak_err[method].append(np.std(peaks))
+                        final_data[method].append(np.mean(finals))
+                        final_err[method].append(np.std(finals))
+                    else:
+                        all_valid = False
+                else:
+                    all_valid = False
             else:
                 log_path = os.path.join(scalability_dir, f"{method}_n{n}.log")
-
-            metrics = _extract_scalability_metrics(log_path)
-            if metrics:
-                peak_data[method].append(metrics["peak"])
-                final_data[method].append(metrics["final"])
-                std_data[method].append(metrics["std"])
-            else:
-                all_valid = False
+                metrics = _extract_scalability_metrics(log_path)
+                if metrics:
+                    peak_data[method].append(metrics["peak"])
+                    peak_err[method].append(0)  # single seed, no error bar
+                    final_data[method].append(metrics["final"])
+                    final_err[method].append(0)
+                else:
+                    all_valid = False
         if all_valid:
             valid_n.append(n)
 
     if not valid_n:
-        print("Warning: No scalability data found, using fallback")
-        valid_n = [3, 5, 7]
+        print("Warning: No scalability data found")
+        valid_n = [3, 5, 7, 10]
         for m in methods:
-            peak_data[m] = [0, 0, 0]
-            final_data[m] = [0, 0, 0]
-            std_data[m] = [0, 0, 0]
+            peak_data[m] = [0, 0, 0, 0]
+            peak_err[m] = [0, 0, 0, 0]
+            final_data[m] = [0, 0, 0, 0]
+            final_err[m] = [0, 0, 0, 0]
 
-    # Left: Peak return bar chart
+    # Left: Peak return bar chart with error bars
     x = np.arange(len(valid_n))
     width = 0.3
 
     for i, method in enumerate(methods):
         bars = ax1.bar(x + i * width, peak_data[method], width,
                       color=COLORS[method], label=METHOD_NAMES[method],
-                      edgecolor="black", lw=0.5, alpha=0.85)
-        # Add value labels on bars
+                      edgecolor="black", lw=0.5, alpha=0.85,
+                      yerr=peak_err[method], capsize=3)
         for bar, val in zip(bars, peak_data[method]):
-            ax1.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.03,
+            ax1.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.05,
                     f"{val:.2f}", ha="center", va="bottom", fontsize=7)
 
-    # Add optimal reference line
-    optimal_vals = [0.5 * n + 1.0 for n in valid_n]  # Optimal return = n*0.5 + 1.0
+    optimal_vals = [0.5 * n + 1.0 for n in valid_n]
     ax1.plot(x + width / 2, optimal_vals, "k--", alpha=0.4, lw=0.8, marker="", label="Optimal")
     ax1.set_xlabel("Number of Agents")
     ax1.set_ylabel("Peak Episode Return")
@@ -326,13 +437,13 @@ def plot_scalability():
     ax1.yaxis.set_major_locator(MaxNLocator(6))
     ax1.grid(True, alpha=0.15, axis="y")
 
-    # Right: Return vs agents line chart with std bands
+    # Right: Return vs agents line chart with error bands
     for method in methods:
         peaks = np.array(peak_data[method])
-        stds = np.array(std_data[method])
+        errs = np.array(peak_err[method])
         ax2.plot(valid_n, peaks, "o-", color=COLORS[method],
                 label=METHOD_NAMES[method], lw=1.8, markersize=7)
-        ax2.fill_between(valid_n, peaks - stds, peaks + stds,
+        ax2.fill_between(valid_n, peaks - errs, peaks + errs,
                         color=COLORS[method], alpha=0.12)
     ax2.plot(valid_n, optimal_vals, "k--", alpha=0.4, lw=0.8, label="Optimal")
 
@@ -397,26 +508,30 @@ def plot_training_curves():
 
     fig, axes = plt.subplots(1, 2, figsize=(8.0, 3.5))
 
-    # --- Left: Key-Lock ---
+    # --- Left: Key-Lock (multi-seed) ---
     ax1 = axes[0]
     methods = ["cmapg", "mappo"]
     keylock_dir = os.path.join(SYS_PATH, "logs")
+    seeds = [42, 123, 456, 789]
 
     for method in methods:
-        for p in [os.path.join(keylock_dir, f"{method}_train.log"),
-                  os.path.join(keylock_dir, "..", "logs_v3", f"{method}_train.log")]:
-            p = os.path.normpath(p)
-            if os.path.exists(p):
-                d = _parse_log(p)
-                ret_smooth = _smooth(d["returns"], 8)
-                ax1.plot(d["steps_ret"] / 1000, ret_smooth,
-                        color=COLORS[method], label=METHOD_NAMES[method], lw=1.5)
-                break
+        metrics_list = _load_multi_seed_metrics(method, seeds, keylock_dir)
+        if not metrics_list:
+            continue
+        steps, mean, std = _align_multi_seed_curves(metrics_list)
+        if len(steps) == 0:
+            continue
+        mean_smooth = _smooth(mean, 8)
+        std_smooth = _smooth(std, 8)
+        ax1.plot(steps / 1000, mean_smooth,
+                color=COLORS[method], label=f"{METHOD_NAMES[method]} ({len(metrics_list)} seeds)", lw=1.5)
+        ax1.fill_between(steps / 1000, mean_smooth - std_smooth, mean_smooth + std_smooth,
+                        color=COLORS[method], alpha=0.15)
 
     ax1.axhline(y=3.4, color="gray", linestyle="--", alpha=0.4, lw=0.8)
     ax1.set_xlabel("Steps (K)")
     ax1.set_ylabel("Episode Return")
-    ax1.set_title("Key-Lock (N=5)", fontweight="bold")
+    ax1.set_title("Key-Lock (N=5, 4 seeds)", fontweight="bold")
     ax1.legend(fontsize=8)
     ax1.yaxis.set_major_locator(MaxNLocator(6))
     ax1.grid(True, alpha=0.2)
@@ -569,9 +684,196 @@ def plot_ablation():
     print(f"Saved: ablation.pdf")
 
 
+def plot_mpe_benchmark():
+    """Plot MPE (Multi-Particle Environment) benchmark results.
+
+    Shows training curves on simple_spread_v3 with N=3 and N=5 agents
+    for CMAPG, MAPPO, and QMIX. Uses multi-seed data when available.
+    """
+    from matplotlib.ticker import MaxNLocator
+
+    # Check multiple possible log directories
+    possible_dirs = [
+        os.path.join(SYS_PATH, "experiments", "logs"),
+        os.path.join(SYS_PATH, "logs"),
+        os.path.join(os.path.dirname(SYS_PATH), "logs"),
+    ]
+    mpe_log_dir = None
+    for d in possible_dirs:
+        if os.path.exists(d) and any("mpe" in x for x in os.listdir(d)):
+            mpe_log_dir = d
+            break
+    if mpe_log_dir is None:
+        mpe_log_dir = possible_dirs[1]  # default
+    scenarios = [
+        ("simple_spread_v3", 3, "simple_spread (N=3)"),
+        ("simple_spread_v3", 5, "simple_spread (N=5)"),
+    ]
+    methods = ["cmapg", "mappo", "qmix"]
+    seeds = [42, 100]
+
+    fig, axes = plt.subplots(1, len(scenarios), figsize=(9.0, 3.5))
+
+    for ax_idx, (scenario, n_agents, title) in enumerate(scenarios):
+        ax = axes[ax_idx] if len(scenarios) > 1 else axes
+
+        for method in methods:
+            # Try to load metrics from available seeds
+            all_returns = []
+            for seed in seeds:
+                exp_dir = os.path.join(mpe_log_dir, f"{method}_mpe_n{n_agents}_s{seed}")
+                metrics_path = os.path.join(exp_dir, "metrics.json")
+                if os.path.exists(metrics_path):
+                    with open(metrics_path) as f:
+                        metrics = _dedup_metrics(json.load(f))
+                    returns = np.array(metrics.get("eval_return_mean", []))
+                    steps = np.array(metrics.get("eval_step", []))
+                    if len(returns) > 0:
+                        all_returns.append((steps, returns))
+
+            if not all_returns:
+                continue
+
+            # Align curves at common steps
+            common_steps = all_returns[0][0]
+            curves = []
+            for steps_seed, returns_seed in all_returns:
+                if len(steps_seed) == len(common_steps):
+                    curves.append(returns_seed)
+
+            if not curves:
+                continue
+
+            stacked = np.array(curves)
+            mean_curve = np.mean(stacked, axis=0)
+            std_curve = np.std(stacked, axis=0)
+
+            window = max(1, len(mean_curve) // 5)
+            mean_smooth = _smooth(mean_curve, window)
+            std_smooth = _smooth(std_curve, window)
+
+            n_seeds = len(curves)
+            label = f"{METHOD_NAMES[method]} ({n_seeds} seed{'s' if n_seeds > 1 else ''})"
+
+            ax.plot(common_steps / 1000, mean_smooth,
+                   color=COLORS[method], label=label, lw=1.5)
+            if n_seeds > 1:
+                ax.fill_between(common_steps / 1000,
+                               mean_smooth - std_smooth,
+                               mean_smooth + std_smooth,
+                               color=COLORS[method], alpha=0.15)
+
+        ax.set_xlabel("Steps (K)")
+        ax.set_ylabel("Episode Return")
+        ax.set_title(title, fontweight="bold")
+        ax.legend(fontsize=7)
+        ax.yaxis.set_major_locator(MaxNLocator(6))
+        ax.grid(True, alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(FIG_DIR, "mpe_benchmark.pdf"))
+    fig.savefig(os.path.join(FIG_DIR, "mpe_benchmark.png"))
+    plt.close(fig)
+    print(f"Saved: mpe_benchmark.pdf")
+
+
+def plot_adv_mode_comparison():
+    """Plot comparison of different advantage computation modes in CMAPG."""
+    from matplotlib.ticker import MaxNLocator
+
+    fig, axes = plt.subplots(1, 2, figsize=(8.0, 3.5))
+
+    log_dir = os.path.join(SYS_PATH, "experiments", "logs")
+    if not os.path.exists(log_dir):
+        log_dir = os.path.join(SYS_PATH, "logs")
+
+    modes = {
+        "softmax_gae": ("CMAPG (softmax_gae)", COLORS["cmapg"]),
+        "direct_cf": ("CMAPG (direct_cf)", COLORS["coma"]),
+        "normalized_cf": ("CMAPG (normalized_cf)", COLORS["qmix"]),
+    }
+
+    # Find experiment dirs
+    for mode_key, (label, color) in modes.items():
+        # Try suffixed dir first
+        exp_dir = os.path.join(log_dir, f"cmapg_key_lock_n5_s42_{mode_key}")
+        if not os.path.exists(exp_dir):
+            exp_dir = os.path.join(log_dir, "cmapg_key_lock_n5_s42")
+        metrics_path = os.path.join(exp_dir, "metrics.json")
+        if not os.path.exists(metrics_path):
+            continue
+
+        with open(metrics_path) as f:
+            metrics = _dedup_metrics(json.load(f))
+        returns = np.array(metrics.get("eval_return_mean", []))
+        steps = np.array(metrics.get("eval_step", []))
+        if len(returns) == 0 or len(steps) != len(returns):
+            continue
+
+        window = max(1, len(returns) // 5)
+        ret_smooth = _smooth(returns, window)
+        axes[0].plot(steps / 1000, ret_smooth, color=color, label=label, lw=1.5)
+
+    axes[0].axhline(y=3.4, color="gray", linestyle="--", alpha=0.4, lw=0.8, label="Optimal (~3.5)")
+    axes[0].set_xlabel("Steps (K)")
+    axes[0].set_ylabel("Episode Return")
+    axes[0].set_title("Advantage Mode: Learning Curves", fontweight="bold")
+    axes[0].legend(fontsize=7)
+    axes[0].yaxis.set_major_locator(MaxNLocator(6))
+    axes[0].grid(True, alpha=0.2)
+
+    # Right: bar chart of peak vs final
+    ax2 = axes[1]
+    labels = []
+    peak_vals = []
+    final_vals = []
+    bar_colors = []
+    for mode_key, (label, color) in modes.items():
+        exp_dir = os.path.join(log_dir, f"cmapg_key_lock_n5_s42_{mode_key}")
+        if not os.path.exists(exp_dir):
+            continue
+        metrics_path = os.path.join(exp_dir, "metrics.json")
+        if not os.path.exists(metrics_path):
+            continue
+        with open(metrics_path) as f:
+            metrics = _dedup_metrics(json.load(f))
+        returns = np.array(metrics.get("eval_return_mean", []))
+        if len(returns) == 0:
+            continue
+        labels.append(label.replace("CMAPG ", ""))
+        peak_vals.append(float(np.max(returns)))
+        final_vals.append(float(np.mean(returns[-5:])) if len(returns) >= 5 else float(returns[-1]))
+        bar_colors.append(color)
+
+    if labels:
+        x = np.arange(len(labels))
+        width = 0.3
+        ax2.bar(x - width/2, peak_vals, width, color=bar_colors, edgecolor="black",
+               lw=0.5, alpha=0.85, label="Peak Return")
+        ax2.bar(x + width/2, final_vals, width, color=bar_colors, edgecolor="black",
+               lw=0.5, alpha=0.4, label="Final Return")
+        for i, (p, f) in enumerate(zip(peak_vals, final_vals)):
+            ax2.text(i - width/2, p + 0.1, f"{p:.2f}", ha="center", fontsize=7)
+            offset = 0.1 if f >= 0 else -0.5
+            ax2.text(i + width/2, f + offset, f"{f:.2f}", ha="center", fontsize=6.5)
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(labels, fontsize=7)
+        ax2.set_ylabel("Episode Return")
+        ax2.set_title("Peak vs Final (Key-Lock N=5)", fontweight="bold")
+        ax2.legend(fontsize=7)
+        ax2.axhline(y=3.4, color="gray", linestyle="--", alpha=0.4, lw=0.8)
+        ax2.grid(True, alpha=0.15, axis="y")
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(FIG_DIR, "adv_mode_comparison.pdf"))
+    fig.savefig(os.path.join(FIG_DIR, "adv_mode_comparison.png"))
+    plt.close(fig)
+    print(f"Saved: adv_mode_comparison.pdf")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate figures for CMAPG paper")
-    parser.add_argument("--all", action="store_true", default=True,
+    parser.add_argument("--all", action="store_true", default=False,
                        help="Generate all figures")
     parser.add_argument("--overview", action="store_true")
     parser.add_argument("--credit", action="store_true")
@@ -579,6 +881,10 @@ def main():
     parser.add_argument("--visualization", action="store_true")
     parser.add_argument("--training", action="store_true")
     parser.add_argument("--ablation", action="store_true")
+    parser.add_argument("--mpe", action="store_true",
+                       help="Generate MPE benchmark figures")
+    parser.add_argument("--advmode", action="store_true",
+                       help="Generate advantage mode comparison figure")
     args = parser.parse_args()
 
     if args.all:
@@ -588,6 +894,8 @@ def main():
         args.visualization = True
         args.training = True
         args.ablation = True
+        args.mpe = True
+        args.advmode = True
 
     figures = []
     if args.overview:
@@ -608,6 +916,12 @@ def main():
     if args.ablation:
         plot_ablation()
         figures.append("ablation")
+    if args.mpe:
+        plot_mpe_benchmark()
+        figures.append("mpe_benchmark")
+    if args.advmode:
+        plot_adv_mode_comparison()
+        figures.append("adv_mode_comparison")
 
     print(f"\nGenerated {len(figures)} figures in {FIG_DIR}/")
     print("Ready for inclusion in paper.tex")
