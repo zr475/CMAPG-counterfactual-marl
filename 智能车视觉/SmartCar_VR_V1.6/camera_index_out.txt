@@ -1,0 +1,3 @@
+Detected Cameras:
+==================
+Index: 0 | Resolution: 1280x720

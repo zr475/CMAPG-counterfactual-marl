@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>视觉组技术方案</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;padding:40px;line-height:1.7}
+.container{max-width:900px;margin:0 auto}
+h1{font-size:2rem;color:#34d399;border-bottom:2px solid #064e3b;padding-bottom:12px;margin-bottom:30px}
+h2{font-size:1.4rem;color:#6ee7b7;margin:28px 0 12px;padding-left:12px;border-left:4px solid #10b981}
+h3{font-size:1.1rem;color:#a7f3d0;margin:16px 0 8px}
+table{width:100%;border-collapse:collapse;margin:12px 0 24px;font-size:.9rem}
+th{background:#064e3b;color:#6ee7b7;padding:10px 12px;text-align:left;border:1px solid #065f46}
+td{padding:8px 12px;border:1px solid #065f46;background:#064e3b}
+tr:nth-child(even) td{background:#0f172a}
+code{background:#334155;padding:2px 6px;border-radius:4px;font-size:.85rem;color:#34d399}
+pre{background:#064e3b;padding:16px;border-radius:8px;overflow-x:auto;margin:12px 0;border:1px solid #065f46;font-size:.85rem}
+pre code{background:none;padding:0;color:#e2e8f0}
+.badge{display:inline-block;background:#10b981;color:#fff;padding:2px 10px;border-radius:12px;font-size:.75rem;margin-left:8px}
+.card{background:#064e3b;border:1px solid #065f46;border-radius:12px;padding:20px;margin:16px 0}
+.warn{background:#78350f;border:1px solid #d97706;border-radius:8px;padding:16px;margin:16px 0}
+.warn strong{color:#fbbf24}
+.step{background:#022c22;border:1px solid #10b981;border-radius:8px;padding:16px;margin:12px 0}
+.step-num{display:inline-block;background:#10b981;color:#000;width:28px;height:28px;border-radius:50%;text-align:center;line-height:28px;font-weight:bold;margin-right:10px}
+ul{margin:8px 0 8px 20px}
+li{margin:4px 0}
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>视觉组技术方案 <span class="badge">第21届智能车 - AI视觉组</span></h1>
+
+<div class="warn">
+<strong>核心任务:</strong> 用 OpenART 摄像头识别<strong>车载手机屏幕</strong>上的游戏画面 (屏幕显示裁判系统投屏的虚拟游戏), 实时输出运动指令给 MCU, 控制车模在 3.2m x 2.4m 场地完成推箱子/飞机大战任务。
+</div>
+
+<div class="card" style="background:#064e3b;border:2px solid #10b981">
+<h3>关键理解：摄像头拍屏幕，不是拍场地</h3>
+<ul>
+<li>OpenART 摄像头朝向 <strong>车载手机屏幕</strong>，拍摄屏幕上显示的游戏画面</li>
+<li>屏幕同时显示 <strong>两个视角</strong>：俯视图 (全局) + 第一人称视角 (各720×540)</li>
+<li>车模在场地上的位置由 <strong>裁判系统全局摄像头</strong> + 车顶 AprilTag 标识牌定位</li>
+<li>摄像头不需要看场地，只拍屏幕</li>
+</ul>
+</div>
+
+<h2>一、你需要做什么</h2>
+<div class="card">
+<h3>整体流程</h3>
+<pre><code>
+裁判系统 ──WiFi投屏──&gt; 手机屏幕 (车上)
+                            |
+                      OpenART 摄像头拍摄
+                            |
+                      图像识别 + 决策算法
+                            |
+                      输出: "$V,vx,vy,wz\n"
+                            |
+                      UART ──&gt; MCU ──&gt; 电机转动 ──&gt; 车移动
+                            |
+                      车移动 = 游戏中角色移动
+</code></pre>
+</div>
+
+<h2>二、游戏任务详解 (依据比赛细则)</h2>
+
+<div class="card">
+<h3>推箱子任务 (当前拟定)</h3>
+<p>比赛内容来自推箱子游戏的演变，按照规则将全部箱子推到目的地即为完成比赛任务。</p>
+<table>
+<tr><th>要素</th><th>规则说明</th></tr>
+<tr><td>出发</td><td>从发车区1或发车区2出发，成功发车后计时开始</td></tr>
+<tr><td>箱子类型</td><td>场地中有可移动箱子 (贴图/颜色) 和目的地箱子 (贴数字)，数量相等</td></tr>
+<tr><td>成功条件</td><td>将可移动箱子推到目的地位置，完成后两者同时消失</td></tr>
+<tr><td>围墙</td><td>小车虚拟位置不可越过黑灰色围墙，否则计时停止</td></tr>
+<tr><td>炸弹</td><td>可能出现在场地中，可炸掉中间围墙 (外围围墙无法炸)</td></tr>
+<tr><td>结束条件</td><td>全部箱子消失 / 剩余箱子无法推动 / 越过外围围墙</td></tr>
+<tr><td>罚时</td><td>未完成箱子每个+30秒，需完成一半以上才有效成绩</td></tr>
+<tr><td>三种难度</td><td>纯推箱子 / 按图片分类推箱子 / 按图片分类升级版</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h3>虚拟元素一览</h3>
+<table>
+<tr><th>元素</th><th>颜色</th><th>尺寸 (像素)</th><th>说明</th></tr>
+<tr><td>可移动箱子</td><td>橙黄色 (135,210,255)</td><td>30×30</td><td>顶部颜色，四周可能贴图</td></tr>
+<tr><td>目的地</td><td>紫色 (170,0,255)</td><td>30×30</td><td>四周贴数字0-9</td></tr>
+<tr><td>车模 (RGB)</td><td>红色(255,0,0) / 蓝色(0,0,255)</td><td>—</td><td>两个色块确定位置和朝向</td></tr>
+<tr><td>围墙</td><td>黑灰色 (90,90,90)</td><td>20宽</td><td>不可穿越</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h3>任务A: 推箱子 (Sokoban)</h3>
+<p><strong>屏幕上会显示:</strong></p>
+<ul>
+<li>你的车 (红色箭头) 的位置和朝向</li>
+<li>带数字标签的箱子 (需要推出边界)</li>
+<li>炸弹 (碰到就失败)</li>
+<li>场地边界</li>
+</ul>
+<p><strong>你需要识别:</strong></p>
+<table>
+<tr><th>目标</th><th>特征</th><th>用途</th></tr>
+<tr><td>自己的车</td><td>红色箭头</td><td>确定当前位置和朝向</td></tr>
+<tr><td>目标箱子</td><td>带数字的方块</td><td>确定推送目标</td></tr>
+<tr><td>炸弹</td><td>特定图标</td><td>路径规划时避开</td></tr>
+<tr><td>边界</td><td>场地边缘线</td><td>确定推出方向</td></tr>
+</table>
+<p><strong>策略:</strong> 绕到箱子背面 -> 对准边界方向 -> 直线推出</p>
+</div>
+
+<div class="card">
+<h3>任务B: 飞机大战 (Plane Wars)</h3>
+<p><strong>屏幕上会显示:</strong></p>
+<ul>
+<li>你的飞机 (车的物理位置映射)</li>
+<li>敌机 (1-3架, 会移动)</li>
+<li>敌方子弹 (需要躲避)</li>
+<li>道具 (可选拾取)</li>
+</ul>
+<p><strong>你需要识别:</strong></p>
+<table>
+<tr><th>目标</th><th>特征</th><th>用途</th></tr>
+<tr><td>敌机</td><td>不同颜色/形状的飞机图标</td><td>瞄准射击 (车朝向=射击方向)</td></tr>
+<tr><td>敌方子弹</td><td>小圆点/线条, 有运动方向</td><td>预判轨迹, 闪避</td></tr>
+<tr><td>自己的飞机</td><td>特定颜色箭头</td><td>确认位置</td></tr>
+<tr><td>道具</td><td>特殊图标</td><td>路径经过时拾取</td></tr>
+</table>
+<p><strong>策略:</strong> 躲子弹优先 -> 对准敌机 (调整车朝向) -> 保持射击线</p>
+<p><strong>成绩:</strong> 击落15架, 时间越短越好, 每掉1血罚时10秒</p>
+</div>
+
+<h2>三、通信协议</h2>
+<div class="card">
+<h3>你发给MCU的 (下行)</h3>
+<table>
+<tr><th>格式</th><th>示例</th><th>说明</th></tr>
+<tr><td><code>$V,vx,vy,wz*XX\n</code></td><td><code>$V,0.5,0,0.1*3A\n</code></td><td>设置速度</td></tr>
+<tr><td><code>$S*XX\n</code></td><td><code>$S*53\n</code></td><td>紧急停车</td></tr>
+<tr><td><code>$R,x,y,yaw*XX\n</code></td><td><code>$R,1.5,2.0,1.57*0B\n</code></td><td>校正里程计位姿 (AprilTag定位后)</td></tr>
+</table>
+
+<h3 style="margin-top:16px">MCU发给你的 (上行)</h3>
+<table>
+<tr><th>格式</th><th>频率</th><th>说明</th></tr>
+<tr><td><code>$P,x,y,yaw,vx,vy,wz\r\n</code></td><td>50Hz</td><td>MCU里程计位姿, 可用于路径规划</td></tr>
+<tr><td><code>$E,stall\r\n</code></td><td>事件</td><td>堵转/碰撞, 收到后需重新规划</td></tr>
+</table>
+
+<h3 style="margin-top:16px">校验说明 (*XX)</h3>
+<p><code>*</code> 后面两位十六进制 = <code>$</code> 到 <code>*</code> 之间所有字节的 XOR。不带 <code>*</code> 也能解析 (向后兼容)。</p>
+<pre><code># Python 计算校验的方法:
+def add_checksum(frame):
+    # frame = "$V,0.5,0,0"
+    xor = 0
+    for c in frame[1:]:  # 跳过'$'
+        xor ^= ord(c)
+    return f"{frame}*{xor:02X}\n"</code></pre>
+
+<h3 style="margin-top:16px">速度字段范围</h3>
+<table>
+<tr><th>字段</th><th>范围</th><th>含义</th></tr>
+<tr><td>vx</td><td>-2.0 ~ +2.0</td><td>横向速度 (m/s), 正=右移</td></tr>
+<tr><td>vy</td><td>-2.0 ~ +2.0</td><td>纵向速度 (m/s), 正=前进</td></tr>
+<tr><td>wz</td><td>-6.0 ~ +6.0</td><td>旋转角速度 (rad/s), 正=逆时针</td></tr>
+</table>
+<p style="margin-top:8px;color:#fbbf24">注: MCU 内部有加速度限制 (0.8 m/s², 2 rad/s²), 速度不会突变, 可以放心发大值。</p>
+
+<h3 style="margin-top:16px">常用指令示例</h3>
+<pre><code>$V,0.5,0,0*2C       # 纯右移 0.5m/s
+$V,0,0.8,0*08       # 快速前进 0.8m/s
+$V,0,0,-1.5*1A      # 顺时针旋转
+$S*53                # 紧急停车 (立即停, 不经减速)
+$R,1.5,2.0,1.57*0B  # 校正位姿 (AprilTag定位后发)</code></pre>
+
+<h3 style="margin-top:16px">硬件连接</h3>
+<p>OpenART UART TX → MCU PA3 (USART2 RX)</p>
+<p>OpenART UART RX → MCU PA2 (USART2 TX)</p>
+<p>波特率: 115200, 8N1</p>
+</div>
+
+<h2>四、开发路线</h2>
+
+<div class="step"><span class="step-num">1</span><strong>PC + OpenCV 原型验证 (第1-2周)</strong>
+<ul>
+<li>用USB摄像头对着电脑屏幕 (模拟游戏画面)</li>
+<li>Python + OpenCV 识别游戏元素</li>
+<li>通过串口发指令给MCU验证</li>
+<li>目标: 能稳定识别箭头/箱子/敌机</li>
+</ul>
+</div>
+
+<div class="step"><span class="step-num">2</span><strong>决策算法开发 (第2-3周)</strong>
+<ul>
+<li>推箱子: 实现 "绕到背面 -> 推出边界" 的路径规划</li>
+<li>飞机大战: 实现 "躲子弹 + 瞄准" 的状态机</li>
+<li>在PC上用模拟画面测试</li>
+</ul>
+</div>
+
+<div class="step"><span class="step-num">3</span><strong>移植到 OpenART (第3-4周)</strong>
+<ul>
+<li>OpenART 支持 MicroPython, 可直接跑 OpenMV 风格代码</li>
+<li>参考: <code>reference_src/openart/OpenART/main.py</code></li>
+<li>注意: OpenART 算力有限, 需要优化识别速度</li>
+</ul>
+</div>
+
+<div class="step"><span class="step-num">4</span><strong>联调优化 (第4-5周)</strong>
+<ul>
+<li>接上实际车模, 调整速度映射</li>
+<li>优化识别帧率 (目标: 20fps+)</li>
+<li>调整决策参数</li>
+</ul>
+</div>
+
+<h2>五、识别算法建议</h2>
+<div class="card">
+<h3>方案A: 传统视觉 (推荐起步)</h3>
+<ul>
+<li>颜色阈值分割 (HSV空间) -> 找红色箭头/蓝色箱子</li>
+<li>轮廓检测 -> 确定位置和大小</li>
+<li>模板匹配 -> 识别数字标签</li>
+<li>优点: 快, 不需要训练, OpenART能跑</li>
+</ul>
+
+<h3 style="margin-top:16px">方案B: 轻量CNN (进阶)</h3>
+<ul>
+<li>YOLOv5-nano 或 MobileNet-SSD</li>
+<li>训练数据: 截图游戏画面, 标注目标</li>
+<li>量化后部署到 OpenART (INT8)</li>
+<li>优点: 鲁棒性好, 但需要训练数据和调优</li>
+</ul>
+</div>
+
+<h2>六、参考代码</h2>
+<div class="card">
+<h3>OpenART 原版视觉代码</h3>
+<p>路径: <code>D:/Study/Roland/智能车/reference_src/openart/OpenART/main.py</code></p>
+<p>这是第17届国一队伍的 OpenART 代码, 包含:</p>
+<ul>
+<li>摄像头初始化和图像采集</li>
+<li>图像分类模型加载</li>
+<li>UART通信发送结果</li>
+</ul>
+<p>你可以在此基础上修改识别逻辑。</p>
+
+<h3 style="margin-top:16px">PC端测试脚本 (快速验证用)</h3>
+<pre><code># test_vision.py - 用PC模拟视觉模块发指令
+import serial, time
+
+def checksum(frame):
+    xor = 0
+    for c in frame[1:]:
+        xor ^= ord(c)
+    return f"{frame}*{xor:02X}\n".encode()
+
+ser = serial.Serial('COM3', 115200)  # 改成你的串口号
+
+# 测试前进
+ser.write(checksum('$V,0,0.5,0'))
+time.sleep(2)
+
+# 测试右移
+ser.write(checksum('$V,0.5,0,0'))
+time.sleep(2)
+
+# 测试旋转
+ser.write(checksum('$V,0,0,1.0'))
+time.sleep(1)
+
+# 校正位姿 (假设AprilTag定位到 x=1.0, y=0.5, yaw=0)
+ser.write(checksum('$R,1.0,0.5,0'))
+
+# 读取MCU上行位姿帧
+while ser.in_waiting:
+    line = ser.readline().decode().strip()
+    if line.startswith('$P,'):
+        parts = line.split(',')
+        x, y, yaw = float(parts[1]), float(parts[2]), float(parts[3])
+        print(f"位姿: x={x:.3f} y={y:.3f} yaw={yaw:.3f}")
+    elif line.startswith('$E,'):
+        print("⚠ 堵转报警! 需要重新规划路径")
+
+# 停车
+ser.write(checksum('$S'))
+ser.close()</code></pre>
+</div>
+
+<h2>七、关键注意事项</h2>
+<table>
+<tr><th>#</th><th>事项</th><th>说明</th></tr>
+<tr><td>1</td><td>帧率</td><td>识别+决策+发送 需要在50ms内完成 (20fps), 否则车反应迟钝</td></tr>
+<tr><td>2</td><td>延迟</td><td>WiFi投屏有50-100ms延迟, 决策时需要预判</td></tr>
+<tr><td>3</td><td>光照</td><td>比赛现场光照可能和训练时不同, 用HSV而非RGB做阈值</td></tr>
+<tr><td>4</td><td>屏幕反光</td><td>摄像头角度要避免屏幕反光, 可加遮光罩</td></tr>
+<tr><td>5</td><td>坐标映射</td><td>屏幕像素坐标 → 场地物理坐标 → 运动指令, 需要标定</td></tr>
+<tr><td>6</td><td>安全</td><td>MCU有500ms超时停车 + 堵转检测, 代码崩溃车会自动停</td></tr>
+<tr><td>7</td><td>位姿反馈</td><td>MCU每20ms发一帧 <code>$P,x,y,yaw,vx,vy,wz</code>, 可用于闭环导航</td></tr>
+<tr><td>8</td><td>堵转处理</td><td>收到 <code>$E,stall</code> 说明撞墙了, 需要后退或换方向</td></tr>
+</table>
+
+</div>
+</body>
+</html>
